@@ -50,6 +50,18 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def report_progress(stage: str, message: str) -> None:
+    """Write optional local dashboard progress without exposing secrets."""
+    target = os.environ.get("REEL_WATCHER_PROGRESS_FILE")
+    if target:
+        try:
+            path = Path(target)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"stage": stage, "message": message}), encoding="utf-8")
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------- input / state
 
 def parse_input(path: Path) -> list[dict]:
@@ -788,6 +800,7 @@ ARCHIVE: Path | None = None  # set by --archive
 
 
 def analyze_video(vision, video: Path, work: Path, collections: list[str], meta: dict) -> tuple[dict, Path | None]:
+    report_progress("probing", "Checking video duration, audio, and scene changes")
     pr = media.probe(str(video))
     dur = pr["duration"]
     cuts = media.detect_cuts(str(video), dur)
@@ -800,6 +813,7 @@ def analyze_video(vision, video: Path, work: Path, collections: list[str], meta:
     tr_box: dict = {}
     wth = None
     if TURBO and pr["has_audio"]:  # whisper (mlx) overlaps frame extraction + OCR (CPU/ANE); joined before the VLM call
+        report_progress("transcribing", "Transcribing speech while sampling video frames")
         def _whisper():
             try:
                 tr_box["tr"] = transcribe_words(video)
@@ -814,6 +828,7 @@ def analyze_video(vision, video: Path, work: Path, collections: list[str], meta:
     afiles: dict = {}
     if TURBO:
         try:
+            report_progress("frames", "Sampling key moments and reading on-screen text")
             afiles = archive_extract(video, times, work / "_arch")
             frames = [(t, work / "_arch" / afiles[round(t, 2)]) for t in times if round(t, 2) in afiles]
             if frames:
@@ -858,6 +873,7 @@ def analyze_video(vision, video: Path, work: Path, collections: list[str], meta:
     }
     t_whisper = time.time() - t_mark
     t_mark = time.time()
+    report_progress("synthesizing", "Turning frames and transcript into a structured lesson")
     wf = bool(any(WORKFLOW_COLLECTION_RE.search(c) for c in collections))
     tx_words = " ".join(f"{w['w']}@{w['s']}" for w in tr["words"])[:5000]
     synth = vlm_ask(vision, "final verdict", SYNTH_PROMPT.format(viewer=VIEWER_CONTEXT, facts=json.dumps(facts, ensure_ascii=False), frames=fmt_turbo_frames(frecs, overview) if overview is not None else fmt_frames(frecs),
@@ -1022,6 +1038,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--run", action="store_true", help="fetch via Apify (paid, small) and analyze")
     ap.add_argument("--limit", type=int, default=0, help="stop after N new reels")
     ap.add_argument("--local", nargs="+", metavar="MP4", help="analyze local video file(s); no download, no Apify, source untouched")
+    ap.add_argument("--local-metadata", help="JSON object keyed by video filename stem, used with --local")
     ap.add_argument("--local-collections", default="", help="with --local: '|' separated labels")
     ap.add_argument("--retry-failed", action="store_true", help="retry reels that failed before (never automatic)")
     ap.add_argument("--rollup", action="store_true", help="rebuild study_index.jsonl from study/*.json and exit")
@@ -1057,6 +1074,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if a.local:
+        local_metadata = {}
+        if a.local_metadata:
+            try:
+                local_metadata = json.loads(Path(a.local_metadata).expanduser().read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                print(f"cannot read local metadata: {exc}")
+                return 2
         missing = media.preflight()
         if missing:
             print(missing)
@@ -1068,13 +1092,18 @@ def main(argv: list[str] | None = None) -> int:
                 src = Path(path).expanduser()
                 code = re.sub(r"[^A-Za-z0-9_-]", "_", src.stem)
                 item = {"url": f"local:{src.name}", "code": code, "collections": [c for c in a.local_collections.split("|") if c], "kind": "reel"}
+                meta = local_metadata.get(src.stem, {})
+                if not isinstance(meta, dict):
+                    meta = {}
+                report_progress("frames", "Preparing the Reel for local analysis")
                 t0 = time.time()
                 work = Path(tempfile.mkdtemp(dir=work_parent))
                 try:
-                    rec, key = analyze_video(vision, src, work, item["collections"], {})
+                    rec, key = analyze_video(vision, src, work, item["collections"], meta)
                     if ARCHIVE:
-                        rec["archive"] = str(archive_commit(ARCHIVE, item, {}, rec, work, [src], keep_source=True))
-                    finalize(out_root, item, {}, rec, key, time.time() - t0)
+                        rec["archive"] = str(archive_commit(ARCHIVE, item, meta, rec, work, [src], keep_source=True))
+                    finalize(out_root, item, meta, rec, key, time.time() - t0)
+                    report_progress("saving", "Saving the transcript, frames, and Reel study")
                 finally:
                     shutil.rmtree(work, ignore_errors=True)
                 print(f"{code}: {time.time() - t0:.1f}s")

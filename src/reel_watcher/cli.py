@@ -6,6 +6,7 @@ import sys
 USAGE = """usage: reel-watcher <command> [options]
 
 commands:
+  dashboard run the local Reel discovery and study interface
   export   convert an Instagram data export (saved_posts.json) into a URL list
   study    fetch (Apify) and analyze saved reels locally; --local analyzes mp4 files; dry run by default
   advice   render an advice library JSON to a static HTML page (optional)
@@ -20,6 +21,8 @@ def main() -> int:
     cmd, rest = sys.argv[1], sys.argv[2:]
     if cmd == "study":
         from .study import main as run
+    elif cmd == "dashboard":
+        from .dashboard import main as run
     elif cmd == "export":
         from .ig_export import main as run
     elif cmd == "advice":
