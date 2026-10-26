@@ -7,3 +7,6 @@ reel-watcher-out/
 .env
 .DS_Store
 .pytest_cache/
+
+# Local agent memory
+.claude/
